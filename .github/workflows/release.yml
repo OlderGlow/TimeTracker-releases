@@ -22,6 +22,14 @@ on:
         required: true
         default: main
         type: string
+      macos:
+        description: Construire aussi l'installeur macOS
+        type: boolean
+        default: false
+      linux:
+        description: Construire aussi les installeurs Linux
+        type: boolean
+        default: false
 
 concurrency:
   group: release
@@ -39,11 +47,28 @@ env:
 
 jobs:
   # Vérifie la version, rédige les notes depuis les PR fusionnées et crée un brouillon de Release, publié seulement
-  # une fois les installeurs déposés.
+  # une fois les installeurs déposés. Un brouillon déjà créé par un lancement précédent est repris tel quel.
   draft:
     name: Brouillon
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
+      # Windows toujours ; macOS (un seul .dmg Intel et Apple Silicon) et Linux seulement si cochés au lancement.
+      - name: Plateformes
+        id: matrix
+        env:
+          MACOS: ${{ inputs.macos }}
+          LINUX: ${{ inputs.linux }}
+        run: |
+          matrix=$(jq -cn --argjson macos "$MACOS" --argjson linux "$LINUX" '{include: (
+            [{name: "Windows", os: "windows-latest", args: ""}]
+            + (if $macos then [{name: "macOS", os: "macos-latest", args: "--target universal-apple-darwin"}] else [] end)
+            + (if $linux then [{name: "Linux", os: "ubuntu-latest", args: ""}] else [] end)
+          )}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "$matrix" | jq -r '.include[].name'
+
       - name: Secrets présents
         env:
           SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
@@ -69,13 +94,16 @@ jobs:
             echo "::error::Demandé $TAG, tauri.conf.json $version, Cargo.toml $cargo_version : les trois doivent correspondre."
             exit 1
           fi
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "::error::La version $TAG existe déjà dans ce dépôt."
+          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null || true)
+          if [ "$draft" = false ]; then
+            echo "::error::La version $TAG est déjà publiée dans ce dépôt."
             exit 1
           fi
+          echo "existing=$draft" >> "$GITHUB_ENV"
 
       # Notes : le titre de chaque PR fusionnée depuis la version publiée précédente.
       - name: Notes de version
+        if: env.existing != 'true'
         env:
           SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
         run: |
@@ -99,12 +127,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { name: Linux, os: ubuntu-latest, args: '' }
-          - { name: Windows, os: windows-latest, args: '' }
-          # Un seul .dmg pour les Mac Intel et Apple Silicon.
-          - { name: macOS, os: macos-latest, args: '--target universal-apple-darwin' }
+      matrix: ${{ fromJSON(needs.draft.outputs.matrix) }}
     env:
       RUSTFLAGS: -A warnings
     steps:
@@ -160,8 +183,8 @@ jobs:
           if [ ! -s installers.txt ]; then echo "::error::Aucun installeur produit."; exit 1; fi
           while IFS= read -r file; do gh release upload "$TAG" "$file" --repo "$GITHUB_REPOSITORY" --clobber; done < installers.txt
 
-  # Publie même si macOS n'a pas pu être construit (faute de machine chez GitHub, par exemple) : Windows et Linux
-  # restent obligatoires (latest.json échoue sans eux).
+  # Publie dès que l'installeur Windows est là (latest.json échoue sans lui) : macOS et Linux sont facultatifs, y compris
+  # quand leur build échoue. Les fichiers déposés par un lancement précédent du même brouillon sont repris.
   publish:
     name: Publication
     needs: build
@@ -192,7 +215,7 @@ jobs:
           mac = entry("*_universal.app.tar.gz", required=False)
           nsis = entry("*-setup.exe")
           msi = entry("*.msi")
-          appimage = entry("*.AppImage")
+          appimage = entry("*.AppImage", required=False)
           latest = {
               "version": tag.lstrip("v"),
               "notes": open("notes.md").read().strip(),
@@ -200,11 +223,11 @@ jobs:
               "platforms": {
                   **({"darwin-aarch64": mac, "darwin-x86_64": mac, "darwin-aarch64-app": mac, "darwin-x86_64-app": mac} if mac else {}),
                   "windows-x86_64": nsis, "windows-x86_64-nsis": nsis, "windows-x86_64-msi": msi,
-                  "linux-x86_64": appimage, "linux-x86_64-appimage": appimage,
+                  **({"linux-x86_64": appimage, "linux-x86_64-appimage": appimage} if appimage else {}),
               },
           }
           json.dump(latest, open("latest.json", "w"), ensure_ascii=False, indent=2)
-          print(json.dumps({k: v for k, v in latest.items() if k != "platforms"}, ensure_ascii=False))
+          print(json.dumps({**{k: v for k, v in latest.items() if k != "platforms"}, "platforms": list(latest["platforms"])}, ensure_ascii=False))
           PY
 
       - name: Publier la Release
