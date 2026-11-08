@@ -1,0 +1,213 @@
+name: Release
+
+# Construit une version de TimeTracker à partir du code du dépôt privé OlderGlow/TimeTracker-Rust et la publie ici,
+# avec latest.json lu par la mise à jour automatique. Lancé à la main (onglet Actions › Release › Run workflow).
+# Dépôt public : les minutes GitHub Actions sont gratuites, et seul le propriétaire peut lancer ce workflow.
+#
+# Secrets du dépôt (Settings › Secrets and variables › Actions) :
+# - SOURCE_TOKEN : jeton GitHub « fine-grained » limité à OlderGlow/TimeTracker-Rust, droit « Contents : lecture » ;
+# - TAURI_SIGNING_PRIVATE_KEY et TAURI_SIGNING_PRIVATE_KEY_PASSWORD : signature des mises à jour.
+#
+# Le code source n'est jamais publié : il est seulement récupéré sur la machine de build. Les avertissements du
+# compilateur sont coupés (RUSTFLAGS -A warnings) pour que les journaux, publics, n'affichent pas d'extraits de code.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version à publier, sans le « v » (doit correspondre à tauri.conf.json et Cargo.toml)
+        required: true
+        type: string
+      ref:
+        description: Branche, tag ou commit du dépôt privé à construire
+        required: true
+        default: main
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  GH_TOKEN: ${{ github.token }}
+  TAG: v${{ inputs.version }}
+  SOURCE_REPO: OlderGlow/TimeTracker-Rust
+
+jobs:
+  # Vérifie la version, rédige les notes depuis les PR fusionnées et crée un brouillon de Release, publié seulement
+  # une fois les installeurs déposés.
+  draft:
+    name: Brouillon
+    runs-on: ubuntu-latest
+    steps:
+      - name: Secrets présents
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          missing=""
+          [ -n "$SOURCE_TOKEN" ] || missing="$missing SOURCE_TOKEN"
+          [ -n "$SIGNING_KEY" ] || missing="$missing TAURI_SIGNING_PRIVATE_KEY"
+          if [ -n "$missing" ]; then echo "::error::Secrets absents :$missing (Settings › Secrets and variables › Actions)."; exit 1; fi
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: La version demandée est celle du code
+        run: |
+          version=$(jq -r .version src-tauri/tauri.conf.json)
+          cargo_version=$(grep -m1 '^version' src-tauri/Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$TAG" ] || [ "$version" != "$cargo_version" ]; then
+            echo "::error::Demandé $TAG, tauri.conf.json $version, Cargo.toml $cargo_version : les trois doivent correspondre."
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::La version $TAG existe déjà dans ce dépôt."
+            exit 1
+          fi
+
+      # Notes : le titre de chaque PR fusionnée depuis la version publiée précédente.
+      - name: Notes de version
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          previous=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || true)
+          head=$(git rev-parse HEAD)
+          {
+            echo "## Nouveautés"
+            echo
+            if [ -n "$previous" ]; then
+              GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/compare/$previous...$head" --paginate \
+                -q '.commits[].commit.message | select(startswith("Merge pull request")) | split("\n") | map(select(length > 0)) | .[1] // empty' \
+                | sed 's/^/- /'
+            fi
+          } > notes.md
+          cat notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target main --title "TimeTracker $TAG" --notes-file notes.md
+
+  build:
+    name: Installeurs (${{ matrix.name }})
+    needs: draft
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux, os: ubuntu-latest, args: '' }
+          - { name: Windows, os: windows-latest, args: '' }
+          # Un seul .dmg pour les Mac Intel et Apple Silicon.
+          - { name: macOS, os: macos-latest, args: '--target universal-apple-darwin' }
+    env:
+      RUSTFLAGS: -A warnings
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: Dépendances système (Linux)
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          build-essential libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
+          librsvg2-dev libxdo-dev libssl-dev patchelf mold
+          && echo "RUSTFLAGS=-A warnings -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      # Pas de cache Rust : un cache de ce dépôt public pourrait être relu par le workflow d'une pull request.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # Dépendances de l'interface ; « tauri build » lance ensuite son build (beforeBuildCommand).
+      - name: Dépendances de l'interface
+        working-directory: ui
+        run: npm ci --no-audit --no-fund
+
+      # CLI Tauri précompilée (npm) : la compiler avec cargo prend 7 à 15 minutes.
+      # Artefacts de mise à jour signés (.app.tar.gz, .AppImage, -setup.exe, .msi et leurs .sig).
+      - name: tauri build
+        working-directory: src-tauri
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx --yes @tauri-apps/cli@2 build --ci ${{ matrix.args }} --config '{"bundle":{"createUpdaterArtifacts":true}}'
+
+      - name: Déposer les installeurs
+        shell: bash
+        run: |
+          # Archive macOS de mise à jour renommée avec la version (« TimeTracker.app.tar.gz » sinon).
+          for f in $(find src-tauri/target -type f -path '*/release/bundle/macos/*.app.tar.gz*'); do
+            mv "$f" "$(dirname "$f")/TimeTracker_${TAG#v}_universal${f##*/TimeTracker}"
+          done
+          find src-tauri/target -type f -path '*/release/bundle/*' \
+            \( -name '*.dmg' -o -name '*.msi' -o -name '*-setup.exe' -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.app.tar.gz' -o -name '*.sig' \) > installers.txt
+          sed 's#.*/##' installers.txt
+          if [ ! -s installers.txt ]; then echo "::error::Aucun installeur produit."; exit 1; fi
+          while IFS= read -r file; do gh release upload "$TAG" "$file" --repo "$GITHUB_REPOSITORY" --clobber; done < installers.txt
+
+  # Publie même si macOS n'a pas pu être construit (faute de machine chez GitHub, par exemple) : Windows et Linux
+  # restent obligatoires (latest.json échoue sans eux).
+  publish:
+    name: Publication
+    needs: build
+    if: ${{ !cancelled() && needs.build.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer les installeurs
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets
+
+      # latest.json : version, notes et, par plateforme, l'adresse de l'installeur et sa signature.
+      - name: Fichier de mise à jour (latest.json)
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body > notes.md
+          python3 - <<'PY'
+          import glob, json, os, datetime
+          tag = os.environ["TAG"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          base = f"https://github.com/{repo}/releases/download/{tag}/"
+          def entry(pattern, required=True):
+              files = [f for f in glob.glob(f"assets/{pattern}") if not f.endswith(".sig")]
+              if not files and not required:
+                  print(f"::warning::Pas d'artefact {pattern} : plateforme absente de cette version.")
+                  return None
+              if len(files) != 1:
+                  raise SystemExit(f"::error::Artefact de mise à jour introuvable ou ambigu : {pattern} -> {files}")
+              name = os.path.basename(files[0])
+              return {"signature": open(files[0] + ".sig").read().strip(), "url": base + name}
+          mac = entry("*_universal.app.tar.gz", required=False)
+          nsis = entry("*-setup.exe")
+          msi = entry("*.msi")
+          appimage = entry("*.AppImage")
+          latest = {
+              "version": tag.lstrip("v"),
+              "notes": open("notes.md").read().strip(),
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": {
+                  **({"darwin-aarch64": mac, "darwin-x86_64": mac, "darwin-aarch64-app": mac, "darwin-x86_64-app": mac} if mac else {}),
+                  "windows-x86_64": nsis, "windows-x86_64-nsis": nsis, "windows-x86_64-msi": msi,
+                  "linux-x86_64": appimage, "linux-x86_64-appimage": appimage,
+              },
+          }
+          json.dump(latest, open("latest.json", "w"), ensure_ascii=False, indent=2)
+          print(json.dumps({k: v for k, v in latest.items() if k != "platforms"}, ensure_ascii=False))
+          PY
+
+      - name: Publier la Release
+        run: |
+          gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
