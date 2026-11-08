@@ -101,22 +101,31 @@ jobs:
           fi
           echo "existing=$draft" >> "$GITHUB_ENV"
 
-      # Notes : le titre de chaque PR fusionnée depuis la version publiée précédente.
+      # Notes : le titre de chaque PR fusionnée depuis le commit de la version publiée précédente. Ce commit est noté en
+      # fin de notes (« <!-- source: … --> ») ; à défaut, le tag de la version, s'il existe dans le dépôt privé.
       - name: Notes de version
         if: env.existing != 'true'
         env:
           SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
         run: |
-          previous=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || true)
+          previous_body=$(gh release view --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)
+          previous=$(printf '%s' "$previous_body" | sed -n 's/.*<!-- source: \([0-9a-f]\{7,40\}\) -->.*/\1/p' | tail -1)
+          [ -n "$previous" ] || previous=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || true)
           head=$(git rev-parse HEAD)
+          titles=""
+          if [ -n "$previous" ]; then
+            if ! titles=$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/compare/$previous...$head" --paginate \
+              -q '.commits[].commit.message | select(startswith("Merge pull request")) | split("\n") | map(select(length > 0)) | .[1] // empty' 2>/dev/null); then
+              echo "::warning::Comparaison impossible depuis $previous : notes sans liste des changements."
+              titles=""
+            fi
+          fi
           {
             echo "## Nouveautés"
             echo
-            if [ -n "$previous" ]; then
-              GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/compare/$previous...$head" --paginate \
-                -q '.commits[].commit.message | select(startswith("Merge pull request")) | split("\n") | map(select(length > 0)) | .[1] // empty' \
-                | sed 's/^/- /'
-            fi
+            if [ -n "$titles" ]; then printf '%s\n' "$titles" | sed 's/^/- /'; else echo "- Améliorations et corrections"; fi
+            echo
+            echo "<!-- source: $head -->"
           } > notes.md
           cat notes.md
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target main --title "TimeTracker $TAG" --notes-file notes.md
@@ -162,13 +171,20 @@ jobs:
 
       # CLI Tauri précompilée (npm) : la compiler avec cargo prend 7 à 15 minutes.
       # Artefacts de mise à jour signés (.app.tar.gz, .AppImage, -setup.exe, .msi et leurs .sig).
+      # Trois essais : l'empaquetage télécharge ses outils (WiX, NSIS, AppRun) depuis GitHub, qui répond parfois 504 ;
+      # la compilation, déjà faite, n'est pas refaite aux essais suivants.
       - name: tauri build
         working-directory: src-tauri
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx --yes @tauri-apps/cli@2 build --ci ${{ matrix.args }} --config '{"bundle":{"createUpdaterArtifacts":true}}'
+        run: |
+          for attempt in 1 2 3; do
+            npx --yes @tauri-apps/cli@2 build --ci ${{ matrix.args }} --config '{"bundle":{"createUpdaterArtifacts":true}}' && exit 0
+            [ "$attempt" = 3 ] || { echo "::warning::Empaquetage échoué (essai $attempt), nouvel essai dans 60 s."; sleep 60; }
+          done
+          exit 1
 
       - name: Déposer les installeurs
         shell: bash
@@ -199,7 +215,7 @@ jobs:
         run: |
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body > notes.md
           python3 - <<'PY'
-          import glob, json, os, datetime
+          import glob, json, os, datetime, re
           tag = os.environ["TAG"]
           repo = os.environ["GITHUB_REPOSITORY"]
           base = f"https://github.com/{repo}/releases/download/{tag}/"
@@ -218,7 +234,8 @@ jobs:
           appimage = entry("*.AppImage", required=False)
           latest = {
               "version": tag.lstrip("v"),
-              "notes": open("notes.md").read().strip(),
+              # Sans le repère « <!-- source: … --> », réservé au workflow.
+              "notes": re.sub(r"\s*<!--.*?-->\s*", "\n", open("notes.md").read()).strip(),
               "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "platforms": {
                   **({"darwin-aarch64": mac, "darwin-x86_64": mac, "darwin-aarch64-app": mac, "darwin-x86_64-app": mac} if mac else {}),
